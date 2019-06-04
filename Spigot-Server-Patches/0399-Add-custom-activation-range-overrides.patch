@@ -1,0 +1,361 @@
+From 9cdb6a0e7e3d6b70bd32da7f6292b875be733c01 Mon Sep 17 00:00:00 2001
+From: LordKorea <lk97798@posteo.net>
+Date: Tue, 4 Jun 2019 14:28:26 +0200
+Subject: [PATCH] Add custom activation range overrides
+
+
+diff --git a/src/main/java/com/destroystokyo/paper/PaperWorldConfig.java b/src/main/java/com/destroystokyo/paper/PaperWorldConfig.java
+index b85406198..fa21f48a9 100644
+--- a/src/main/java/com/destroystokyo/paper/PaperWorldConfig.java
++++ b/src/main/java/com/destroystokyo/paper/PaperWorldConfig.java
+@@ -1,7 +1,12 @@
+ package com.destroystokyo.paper;
+ 
++import java.util.Collections;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.Optional;
+ 
++import net.minecraft.server.EntityTypes;
+ import org.bukkit.Bukkit;
+ import org.bukkit.configuration.file.YamlConfiguration;
+ import org.spigotmc.SpigotWorldConfig;
+@@ -494,4 +499,45 @@ public class PaperWorldConfig {
+         keepLoadedRange = (short) (getInt("keep-spawn-loaded-range", Math.min(spigotConfig.viewDistance, 10)) * 16);
+         log( "Keep Spawn Loaded Range: " + (keepLoadedRange/16));
+     }
++
++    public Map<EntityTypes<?>, Integer> customActivationRanges;
++    private void customActivationRanges() {
++        List<?> rangeSettings = getList("custom-activation-ranges", Collections.emptyList());
++
++        customActivationRanges = new HashMap<>();
++        for (Object element : rangeSettings) {
++            if (!(element instanceof Map<?, ?>)) {
++                logError("Warning: Custom activation range entry is not Map but " + element.getClass().getSimpleName());
++                continue;
++            }
++            Map<?, ?> map = (Map<?, ?>) element;
++
++            for (Map.Entry<?, ?> entry : map.entrySet()) {
++                if (!(entry.getKey() instanceof String)) {
++                    logError("Warning: Custom activation range key type is not String but " + entry.getKey().getClass().getSimpleName());
++                    continue;
++                }
++                if (!(entry.getValue() instanceof Integer)) {
++                    logError("Warning: Custom activation range value type is not Integer but " + entry.getKey().getClass().getSimpleName());
++                    continue;
++                }
++                String key = (String) entry.getKey();
++                int range = (Integer) entry.getValue();
++
++                if (range < 0) {
++                    logError("Warning: Invalid custom activation range " + range + " for entity type " + key);
++                    continue;
++                }
++
++                Optional<EntityTypes<?>> entityType = EntityTypes.getByName(key);
++                if (!entityType.isPresent()) {
++                    logError("Warning: Unknown entity type " + key);
++                    continue;
++                }
++
++                customActivationRanges.put(entityType.get(), range);
++                log("Custom activation range override: " + key + " = " + range);
++            }
++        }
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/Entity.java b/src/main/java/net/minecraft/server/Entity.java
+index fffe26939..bf98b1ab4 100644
+--- a/src/main/java/net/minecraft/server/Entity.java
++++ b/src/main/java/net/minecraft/server/Entity.java
+@@ -225,7 +225,7 @@ public abstract class Entity implements INamableTileEntity, ICommandListener, Ke
+         if (world != null) {
+             this.dimension = world.worldProvider.getDimensionManager();
+             // Spigot start
+-            this.defaultActivationState = org.spigotmc.ActivationRange.initializeEntityActivationState(this, world.spigotConfig);
++            this.defaultActivationState = org.spigotmc.ActivationRange.initializeEntityActivationState(this, world.spigotConfig, world); // Paper - pass world for custom activation ranges
+         } else {
+             this.defaultActivationState = false;
+         }
+diff --git a/src/main/java/net/minecraft/server/EntityTypes.java b/src/main/java/net/minecraft/server/EntityTypes.java
+index 77d4bbce1..2addffc08 100644
+--- a/src/main/java/net/minecraft/server/EntityTypes.java
++++ b/src/main/java/net/minecraft/server/EntityTypes.java
+@@ -141,6 +141,7 @@ public class EntityTypes<T extends Entity> {
+         return IRegistry.ENTITY_TYPE.getKey(entitytypes);
+     }
+ 
++    public static Optional<EntityTypes<?>> getByName(String name) { return a(name); } // Paper - OBFHELPER
+     public static Optional<EntityTypes<?>> a(String s) {
+         return IRegistry.ENTITY_TYPE.getOptional(MinecraftKey.a(s));
+     }
+diff --git a/src/main/java/org/spigotmc/ActivationRange.java b/src/main/java/org/spigotmc/ActivationRange.java
+index 77f1563af..8d6713909 100644
+--- a/src/main/java/org/spigotmc/ActivationRange.java
++++ b/src/main/java/org/spigotmc/ActivationRange.java
+@@ -37,9 +37,14 @@ public class ActivationRange
+ {
+ 
+     static AxisAlignedBB maxBB = new AxisAlignedBB( 0, 0, 0, 0, 0, 0 );
+-    static AxisAlignedBB miscBB = new AxisAlignedBB( 0, 0, 0, 0, 0, 0 );
+-    static AxisAlignedBB animalBB = new AxisAlignedBB( 0, 0, 0, 0, 0, 0 );
+-    static AxisAlignedBB monsterBB = new AxisAlignedBB( 0, 0, 0, 0, 0, 0 );
++    // Paper start - Custom overrides for activation range
++    static final int RESERVED_TYPES = 4;
++    static final int MAX_ACTIVATION_TYPES = 128;
++    static java.util.Map<net.minecraft.server.EntityTypes<?>, Byte> activationTypeOverrides = new java.util.LinkedHashMap<>();
++    static java.util.Map<String, java.util.Map<Byte, Integer>> customActivationRanges = new java.util.HashMap<>();
++    static java.util.Map<String, Integer> maxCustomRanges = new java.util.HashMap<>();
++    static AxisAlignedBB[] activationBBs = new AxisAlignedBB[MAX_ACTIVATION_TYPES];
++    // Paper end
+ 
+     /**
+      * Initializes an entities type on construction to specify what group this
+@@ -50,6 +55,10 @@ public class ActivationRange
+      */
+     public static byte initializeEntityActivationType(Entity entity)
+     {
++        // Paper start - honor per-world activation type overrides
++        java.util.Optional<Byte> typeOverride = getOverrideType(entity);
++        if (typeOverride.isPresent()) return typeOverride.get();
++        // Paper end
+         if ( entity instanceof EntityMonster || entity instanceof EntitySlime )
+         {
+             return 1; // Monster
+@@ -69,12 +78,9 @@ public class ActivationRange
+      * @param config Spigot config to determine ranges
+      * @return boolean If it should always tick.
+      */
+-    public static boolean initializeEntityActivationState(Entity entity, SpigotWorldConfig config)
++    public static boolean initializeEntityActivationState(Entity entity, SpigotWorldConfig config, World world) // Paper - world needed for custom activation ranges
+     {
+-        if ( ( entity.activationType == 3 && config.miscActivationRange == 0 )
+-                || ( entity.activationType == 2 && config.animalActivationRange == 0 )
+-                || ( entity.activationType == 1 && config.monsterActivationRange == 0 )
+-                || entity instanceof EntityHuman
++        if ( entity instanceof EntityHuman // Paper - remove activation types covered by check below
+                 || entity instanceof EntityProjectile
+                 || entity instanceof EntityEnderDragon
+                 || entity instanceof EntityComplexPart
+@@ -90,7 +96,7 @@ public class ActivationRange
+             return true;
+         }
+ 
+-        return false;
++        return isActivationRangeDisabled(world, entity); // Paper - honor custom activation range settings
+     }
+ 
+     /**
+@@ -108,16 +114,27 @@ public class ActivationRange
+ 
+         int maxRange = Math.max( monsterActivationRange, animalActivationRange );
+         maxRange = Math.max( maxRange, miscActivationRange );
++        // Paper start - honor custom activation ranges when determining the max range
++        tryInitializeCustomRanges(world);
++        maxRange = Math.max(maxRange, maxCustomRanges.get(world.worldData.getName()));
++        // Paper end
+         maxRange = Math.min( ( world.spigotConfig.viewDistance << 4 ) - 8, maxRange );
+ 
++        java.util.Map<Byte, Integer> worldActivationRanges = customActivationRanges.get(world.worldData.getName()); // Paper
+         for ( EntityHuman player : world.getPlayers() )
+         {
+ 
+             player.activatedTick = MinecraftServer.currentTick;
+             maxBB = player.getBoundingBox().grow( maxRange, 256, maxRange );
+-            miscBB = player.getBoundingBox().grow( miscActivationRange, 256, miscActivationRange );
+-            animalBB = player.getBoundingBox().grow( animalActivationRange, 256, animalActivationRange );
+-            monsterBB = player.getBoundingBox().grow( monsterActivationRange, 256, monsterActivationRange );
++            // Paper start - AABBs for all activation types
++            for (java.util.Map.Entry<Byte, Integer> entry : worldActivationRanges.entrySet()) {
++                byte type = entry.getKey();
++                if (type > 0) {
++                    int range = entry.getValue();
++                    activationBBs[type] = player.getBoundingBox().grow(range, 256, range);
++                }
++            }
++            // Paper end
+ 
+             int i = MathHelper.floor( maxBB.minX / 16.0D );
+             int j = MathHelper.floor( maxBB.maxX / 16.0D );
+@@ -156,27 +173,11 @@ public class ActivationRange
+                         entity.activatedTick = MinecraftServer.currentTick;
+                         continue;
+                     }
+-                    switch ( entity.activationType )
+-                    {
+-                        case 1:
+-                            if ( monsterBB.c( entity.getBoundingBox() ) )
+-                            {
+-                                entity.activatedTick = MinecraftServer.currentTick;
+-                            }
+-                            break;
+-                        case 2:
+-                            if ( animalBB.c( entity.getBoundingBox() ) )
+-                            {
+-                                entity.activatedTick = MinecraftServer.currentTick;
+-                            }
+-                            break;
+-                        case 3:
+-                        default:
+-                            if ( miscBB.c( entity.getBoundingBox() ) )
+-                            {
+-                                entity.activatedTick = MinecraftServer.currentTick;
+-                            }
++                    // Paper start - Check in custom AABB
++                    if (activationBBs[entity.activationType].c(entity.getBoundingBox())) {
++                        entity.activatedTick = MinecraftServer.currentTick;
+                     }
++                    // Paper end
+                 }
+             }
+         }
+@@ -276,4 +277,95 @@ public class ActivationRange
+         }
+         return isActive;
+     }
++
++    // Paper start - custom activation ranges
++    /**
++     * Initialize custom activation ranges for the given world if not already done
++     *
++     * @param world The world to initialize custom activation ranges for
++     */
++    private static void tryInitializeCustomRanges(World world) {
++        if (!customActivationRanges.containsKey(world.worldData.getName())) {
++            java.util.Map<Byte, Integer> activationRanges = new java.util.LinkedHashMap<>();
++            // Fill default values to reserve activation types in use
++            activationRanges.put((byte) 0, 1); // 0 is reserved to have a continuous range of types
++            activationRanges.put((byte) 1, world.spigotConfig.monsterActivationRange);
++            activationRanges.put((byte) 2, world.spigotConfig.animalActivationRange);
++            activationRanges.put((byte) 3, world.spigotConfig.miscActivationRange);
++
++            // Fill in overridden types with default values (to allow teleporting of entities between worlds)
++            for (java.util.Map.Entry<net.minecraft.server.EntityTypes<?>, Byte> entry : activationTypeOverrides.entrySet()) {
++                switch (entry.getKey().d()) {
++                    case MONSTER:
++                        activationRanges.put(entry.getValue(), world.spigotConfig.monsterActivationRange);
++                        break;
++                    case CREATURE:
++                    case AMBIENT:
++                    case WATER_CREATURE:
++                        activationRanges.put(entry.getValue(), world.spigotConfig.animalActivationRange);
++                        break;
++                    default:
++                    case MISC:
++                        activationRanges.put(entry.getValue(), world.spigotConfig.miscActivationRange);
++                        break;
++                }
++            }
++
++            int maxRange = 0;
++            for (java.util.Map.Entry<net.minecraft.server.EntityTypes<?>, Integer> entry : world.paperConfig.customActivationRanges.entrySet()) {
++                if (!activationTypeOverrides.containsKey(entry.getKey())) {
++                    boolean override = overrideType(entry.getKey());
++                    if (!override) {
++                        continue;
++                    }
++                }
++                byte type = activationTypeOverrides.get(entry.getKey());
++                activationRanges.put(type, entry.getValue());
++                maxRange = Math.max(maxRange, entry.getValue());
++            }
++
++            customActivationRanges.put(world.worldData.getName(), activationRanges);
++            maxCustomRanges.put(world.worldData.getName(), maxRange);
++        }
++    }
++
++    /**
++     * Creates an activation type override for the given entity type
++     *
++     * @param entityType The entity type
++     * @return {@code true} if the type was sucessfully overridden
++     */
++    private static boolean overrideType(net.minecraft.server.EntityTypes<?> entityType) {
++        if (activationTypeOverrides.size() == MAX_ACTIVATION_TYPES - RESERVED_TYPES) {
++            // Can not create new override. Return default activation type.
++            org.bukkit.Bukkit.getLogger().log(java.util.logging.Level.WARNING, "Warning: Too many entity types specified in custom activation ranges - Ignoring setting for " + entityType.getKey());
++            return false;
++        }
++        byte type = (byte) (activationTypeOverrides.size() + RESERVED_TYPES);
++        activationTypeOverrides.put(entityType, type);
++        return true;
++    }
++
++    /**
++     * Returns the overridden activation type for the given entity, if any
++     *
++     * @param entity The entity to get the overridden activation type of
++     * @return The overridden activation type, if any
++     */
++    private static java.util.Optional<Byte> getOverrideType(Entity entity) {
++        return java.util.Optional.ofNullable(activationTypeOverrides.get(entity.getEntityType()));
++    }
++
++    /**
++     * Checks whether the activation range feature was disabled for this entity via the configuration
++     *
++     * @param world The world
++     * @param entity The entity to check
++     * @return {@code true} if the activation range feature was disabled for this entity via the configuration
++     */
++    private static boolean isActivationRangeDisabled(World world, Entity entity) {
++        tryInitializeCustomRanges(world);
++        return customActivationRanges.get(world.worldData.getName()).get(entity.activationType) == 0;
++    }
++    // Paper end
+ }
+diff --git a/src/main/java/org/spigotmc/TrackingRange.java b/src/main/java/org/spigotmc/TrackingRange.java
+index 18d0a92f8..cef60873f 100644
+--- a/src/main/java/org/spigotmc/TrackingRange.java
++++ b/src/main/java/org/spigotmc/TrackingRange.java
+@@ -1,12 +1,16 @@
+ package org.spigotmc;
+ 
+ import net.minecraft.server.Entity;
++import net.minecraft.server.EntityAmbient; // Paper
++import net.minecraft.server.EntityCreature; // Paper
+ import net.minecraft.server.EntityExperienceOrb;
+ import net.minecraft.server.EntityGhast;
+ import net.minecraft.server.EntityItem;
+ import net.minecraft.server.EntityItemFrame;
++import net.minecraft.server.EntityMonster; // Paper
+ import net.minecraft.server.EntityPainting;
+ import net.minecraft.server.EntityPlayer;
++import net.minecraft.server.EntitySlime; // Paper
+ 
+ public class TrackingRange
+ {
+@@ -25,19 +29,22 @@ public class TrackingRange
+         if ( entity instanceof EntityPlayer )
+         {
+             return config.playerTrackingRange;
+-        }  else if ( entity.activationType == 1 )
++        }  else if ( entity.activationType == 1 || (entity.activationType > 3 && (entity instanceof EntityMonster || entity instanceof EntitySlime))) // Paper - more activation types due to custom activation ranges
+         {
+             return config.monsterTrackingRange;
+         } else if ( entity instanceof EntityGhast )
+         {
+-            if ( config.monsterTrackingRange > config.monsterActivationRange )
++            // Paper start - get actual activation range for the ghast
++            int activationRange = entity.world.paperConfig.customActivationRanges.getOrDefault(entity.getEntityType(), config.monsterActivationRange);
++            if ( config.monsterTrackingRange > activationRange )
+             {
+                 return config.monsterTrackingRange;
+             } else
+             {
+-                return config.monsterActivationRange;
++                return activationRange;
+             }
+-        } else if ( entity.activationType == 2 )
++            // Paper end
++        } else if ( entity.activationType == 2 || (entity.activationType > 3 && (entity instanceof EntityCreature || entity instanceof EntityAmbient))) // Paper - more activation types due to custom activation ranges
+         {
+             return config.animalTrackingRange;
+         } else if ( entity instanceof EntityItemFrame || entity instanceof EntityPainting || entity instanceof EntityItem || entity instanceof EntityExperienceOrb )
+-- 
+2.21.0
+
